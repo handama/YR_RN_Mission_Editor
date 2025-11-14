@@ -488,6 +488,7 @@
     <ClCompile Include="ChangeSizeDlg.cpp" />
     <ClCompile Include="CliffModifier.cpp" />
     <ClCompile Include="ComboUInputDlg.cpp" />
+    <ClCompile Include="CsfViewer.cpp" />
     <ClCompile Include="DynamicGraphDlg.cpp" />
     <ClCompile Include="FinalSun.cpp" />
     <ClCompile Include="FinalSunDlg.cpp" />
@@ -599,6 +600,7 @@
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="MissionEditor.rc" />
+    <ResourceCompile Include="res\VersionInfo.rc" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Aircraft.h" />
@@ -614,6 +616,7 @@
     <ClInclude Include="ChangeSizeDlg.h" />
     <ClInclude Include="CliffModifier.h" />
     <ClInclude Include="ComboUInputDlg.h" />
+    <ClInclude Include="CsfViewer.h" />
     <ClInclude Include="defines.h" />
     <ClInclude Include="Helpers.h" />
     <ClInclude Include="IniHelper.h" />

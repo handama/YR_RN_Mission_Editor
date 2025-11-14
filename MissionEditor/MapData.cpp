@@ -77,6 +77,7 @@ This function calculates a number for the specified building type.
 Because this function is slow, you should only use it to fill the
 buildingid map
 */
+static size_t constexpr mapDefinedStartOffset = 0x0C00;
 
 int getItemNumber(const CString& section, const CString& name) {
 	auto const& ini = Map->GetIniFile();
@@ -89,9 +90,31 @@ int getItemNumber(const CString& section, const CString& name) {
 	idx = ini.GetSection(section).FindValue(name);
 	if (idx > -1) {
 		// why ?
-		return idx + 0x0C00;
+		return idx + mapDefinedStartOffset;
 	}
 	return -1;
+}
+
+CString getItemId(const CString& section, size_t offset) {
+	auto const& rulesSec = rules.GetSection(section);
+	if (offset < rulesSec.Size()) {
+		return rulesSec.Nth(offset).second;
+	}
+
+	do {
+		if (offset < mapDefinedStartOffset) {
+			break;
+		}
+		offset -= mapDefinedStartOffset;
+		auto const& mapSec = Map->GetIniFile().GetSection(section);
+		if (offset >= mapSec.Size()) {
+			break;
+		}
+		return mapSec.Nth(offset).second;
+
+	} while (0);
+
+	throw std::runtime_error("invalid offset");
 }
 
 inline int GetBuildingNumber(const CString& name)
@@ -110,6 +133,11 @@ inline int GetSmudgeNumber(const CString& name)
 	return getItemNumber("SmudgeTypes", name);
 }
 #endif
+
+CString CMapData::GetBuildingIDBy(size_t offset)
+{
+	return getItemId("BuildingTypes", offset);
+}
 
 SNAPSHOTDATA::SNAPSHOTDATA()
 {
@@ -131,12 +159,10 @@ FIELDDATA::FIELDDATA()
 	smudgetype = -1;
 #endif
 	unit = -1;
-	int i;
-	for (i = 0; i < SUBPOS_COUNT; i++)
+	for (int i = 0; i < SUBPOS_COUNT; i++) {
 		infantry[i] = -1;
+	}
 	aircraft = -1;
-	structure = -1;
-	structuretype = -1;
 	terrain = -1;
 	waypoint = -1;
 	overlay = 0xFF;
@@ -532,7 +558,7 @@ void CMapData::UpdateIniFile(DWORD dwFlags)
 
 }
 
-void CMapData::LoadMap(const std::string& file)
+void CMapData::LoadMap(const CString& file)
 {
 	errstream << "LoadMap() frees memory\n";
 	errstream.flush();
@@ -577,7 +603,7 @@ void CMapData::LoadMap(const std::string& file)
 
 	// any .mpr is a multi map. Previous FinalAlert/FinalSun versions did not set this value correctly->
 	char lowc[MAX_PATH] = { 0 };
-	strcpy_s(lowc, file.c_str());
+	strcpy_s(lowc, file);
 	_strlwr(lowc);
 	if (strstr(lowc, ".mpr")) {
 		m_mapfile.SetString("Basic", "MultiplayerOnly", "1");
@@ -1019,9 +1045,55 @@ void CMapData::Unpack()
 
 }
 
+uint64_t toUInt64(const MAPFIELDDATA& data) {
+	auto const tileIdx = std::max<short>(static_cast<short>(data.wGround), 0);
+	return (static_cast<uint64_t>(data.wX) << 24) |
+		(static_cast<uint64_t>(data.bHeight) << 16) |
+		(static_cast<uint64_t>(tileIdx));
+}
 
+std::vector<BYTE> CMapData::compressAndSortMapData(const BYTE* rawData, const size_t rawLen)
+{
+	if ((rawLen % MAPFIELDDATA_SIZE) != 0) {
+		throw std::invalid_argument("input data packing err");
+	}
 
+	std::vector<BYTE> ret; 
+	ret.reserve(rawLen);
 
+	auto const elementSize = rawLen / MAPFIELDDATA_SIZE;
+	for (auto idx = 0; idx < elementSize; ++idx) {
+		auto const& fieldData = reinterpret_cast<const MAPFIELDDATA*>(rawData)[idx];
+#if 0 // useless
+		if (lutMap.find(MAKELONG(fieldData.wX, fieldData.wY)) == lutMap.end()) {
+			continue;
+		}
+		auto const fieldDataExt = this->GetFielddataAt(fieldData.wX, fieldData.wY);
+		if (fieldDataExt->wGround < 1 && fieldDataExt->bHeight < 1 && fieldDataExt->bSubTile < 1 && fieldDataExt->bMapData2 < 1) {
+			continue;
+		}
+#endif
+		//auto const tileKey = MAKELONG(fieldData.wGround, fieldData.wTileNum);
+		auto const tileKey = static_cast<short>(fieldData.wGround);
+		if (tileKey < 1 && fieldData.bHeight < 1 && fieldData.bSubTile < 1 && fieldData.bIceGrowth < 1) {
+			continue;
+		}
+		ret.insert(ret.end(),
+			reinterpret_cast<const BYTE*>(&fieldData),
+			reinterpret_cast<const BYTE*>(&fieldData) + MAPFIELDDATA_SIZE);
+	}
+
+	assert(ret.size() % MAPFIELDDATA_SIZE == 0);
+	auto const newElementSize = ret.size() / MAPFIELDDATA_SIZE;
+	std::stable_sort(reinterpret_cast<MAPFIELDDATA*>(ret.data()),
+		reinterpret_cast<MAPFIELDDATA*>(ret.data() + ret.size()),
+		[](const MAPFIELDDATA& lhs, const MAPFIELDDATA& rhs) {
+			return toUInt64(lhs) < toUInt64(rhs);
+		}
+	);
+
+	return ret;
+}
 
 
 void CMapData::Pack(BOOL bCreatePreview, BOOL bCompression)
@@ -1187,9 +1259,12 @@ void CMapData::Pack(BOOL bCreatePreview, BOOL bCompression)
 	errstream << "Pack isomappack" << endl;
 	errstream.flush();
 
-
-	hexpackedLen = FSunPackLib::EncodeIsoMapPack5(m_mfd, dwIsoMapSize * MAPFIELDDATA_SIZE, &hexpacked);
-
+	auto const mapDataSize = dwIsoMapSize * MAPFIELDDATA_SIZE;
+	{
+		auto const mapRectStr = INIHelper::Split(m_mapfile.GetString("Map", "Size"));
+		auto compressedData = compressAndSortMapData(m_mfd, mapDataSize);
+		hexpackedLen = FSunPackLib::EncodeIsoMapPack5(compressedData.data(), compressedData.size(), &hexpacked);
+	}
 
 	errstream << "done" << endl;
 	errstream.flush();
@@ -1545,23 +1620,49 @@ void CMapData::UpdateAircraft(BOOL bSave)
 	}
 }
 
+void removeFromStructureSet(StructureSet& structures, const size_t id)
+{
+	auto const it = std::remove_if(structures.begin(), structures.end(),
+		[id](const StructureData& item) {
+			return id == item.structure;
+		});
+	structures.erase(it, structures.end());
+}
+
+void CMapData::updateFieldDataAroundStructure(const CString& typeId, const size_t id, const int x, const int y, bool reset)
+{
+	const int typeIdx = buildingid.at(typeId);
+	for (int h = 0; h < buildinginfo[typeIdx].h; h++) {
+		for (int e = 0; e < buildinginfo[typeIdx].w; e++) {
+			const int pos = (x + h) + (y + e) * GetIsoSize();
+
+			if (pos < fielddata.size()) {
+				auto& data = fielddata[pos];
+				if (reset) {
+					removeFromStructureSet(data.structures, id);
+				} else {
+					data.structures.emplace_back(id, typeIdx);
+				}
+			}
+			Mini_UpdatePos(x + h, y + e, IsMultiplayer());
+		}
+	}
+}
+
 void CMapData::UpdateStructures(BOOL bSave)
 {
 	if (bSave != FALSE) {
 		return;
 	}
 	for (auto i = 0; i < GetIsoSize() * GetIsoSize(); i++) {
-		fielddata[i].structure = -1;
-		fielddata[i].structuretype = -1;
+		fielddata[i].structures.clear();
 	}
 
 	m_structurepaint.clear();
 
-	auto const& sec = m_mapfile["Structures"];
-
-	for (auto i = 0; i < sec.Size(); i++) {
+	for (auto const& [index, val] : m_mapfile.GetSection("Structures")) {
 		STRUCTUREPAINT sp;
-		auto const& val = sec.Nth(i).second;
+		const size_t indexNum = atoi(index);
 		sp.col = ((CFinalSunDlg*)theApp.m_pMainWnd)->m_view.m_isoview->GetColor(GetParam(val, 0));
 		sp.strength = atoi(GetParam(val, 2));
 		sp.upgrade1 = GetParam(val, 12);
@@ -1577,18 +1678,22 @@ void CMapData::UpdateStructures(BOOL bSave)
 		TruncSpace(sp.upgrade2);
 		TruncSpace(sp.upgrade3);
 
-		m_structurepaint.push_back(sp);
+		m_structurepaint.insert_or_assign(indexNum, sp);
 
 		int x = atoi(GetParam(val, 4));
 		int y = atoi(GetParam(val, 3));
 		int d, e;
-		int bid = buildingid[GetParam(val, 1)];
+
+		auto const bidIt = buildingid.find(sp.type);
+		if (bidIt == buildingid.end()) {
+			continue;
+		}
+		const int bid = bidIt->second;
 		for (d = 0; d < buildinginfo[bid].h; d++) {
 			for (e = 0; e < buildinginfo[bid].w; e++) {
 				int pos = (x + d) + (y + e) * GetIsoSize();
 				if (pos < fielddata.size()) {
-					fielddata[pos].structure = i;
-					fielddata[pos].structuretype = bid;
+					fielddata[pos].structures.emplace_back(indexNum, bid);
 				}
 
 				Mini_UpdatePos(x + d, y + e, IsMultiplayer());
@@ -1751,18 +1856,17 @@ void CMapData::UpdateNodes(BOOL bSave)
 			CString nodeName;
 			GetNodeID(nodeName, idx);
 			auto const& nodeVal = sec.GetString(nodeName);
-			CString type, sx, sy;
-			type = GetParam(nodeVal, 0);
-			sy = GetParam(nodeVal, 1);
-			sx = GetParam(nodeVal, 2);
+			const auto type = GetParam(nodeVal, 0);
+			const auto sy = GetParam(nodeVal, 1);
+			const auto sx = GetParam(nodeVal, 2);
 
-			int x = atoi(sx);
-			int y = atoi(sy);
-			int bid = buildingid[type];
+			const int x = atoi(sx);
+			const int y = atoi(sy);
+			const int bid = buildingid.at(type);
 			for (auto d = 0; d < buildinginfo[bid].h; d++) {
 				for (auto f = 0; f < buildinginfo[bid].w; f++) {
 					int pos = x + d + (y + f) * GetIsoSize();
-					fielddata[pos].node.type = buildingid[type];
+					fielddata[pos].node.type = bid;
 					fielddata[pos].node.house = id;
 					fielddata[pos].node.index = idx;
 				}
@@ -1920,6 +2024,15 @@ void CMapData::DeleteCelltag(DWORD dwIndex)
 	}
 }
 
+bool CMapData::DeleteAllStructureAt(const size_t dwPos)
+{
+	auto const structures = GetStructureAt(dwPos);
+	for (auto const& item : structures) {
+		DeleteStructure(item.structure);
+	}
+	return true;
+}
+
 void CMapData::DeleteUnit(DWORD dwIndex)
 {
 	if (dwIndex >= GetUnitCount()) {
@@ -1940,7 +2053,7 @@ void CMapData::DeleteUnit(DWORD dwIndex)
 	Mini_UpdatePos(x, y, IsMultiplayer());
 }
 
-void CMapData::DeleteStructure(DWORD dwIndex)
+void CMapData::DeleteNthStructure(const size_t dwIndex)
 {
 	if (dwIndex >= GetStructureCount()) {
 		return;
@@ -1948,26 +2061,31 @@ void CMapData::DeleteStructure(DWORD dwIndex)
 
 	auto const& pSec = m_mapfile.TryGetSection("Structures");
 	ASSERT(pSec != nullptr);
-	auto const& val = pSec->Nth(dwIndex).second;
-	int x = atoi(GetParam(val, 4));
-	int y = atoi(GetParam(val, 3));
+	auto const& [idStr, val] = pSec->Nth(dwIndex);
+	const int id = atoi(idStr);
+	const int x = atoi(GetParam(val, 4));
+	const int y = atoi(GetParam(val, 3));
 	CString type = GetParam(val, 1);
 
 	pSec->RemoveAt(dwIndex);
 
 	if (!m_noAutoObjectUpdate) {
-		UpdateStructures(FALSE);
+		auto const refCout = m_structurepaint.erase(id);
+		ASSERT(refCout == 1);
+		updateFieldDataAroundStructure(type, id, x, y, true);
 	}
+}
 
-	int d, e;
-	int bid = buildingid[type];
-	for (d = 0; d < buildinginfo[bid].h; d++) {
-		for (e = 0; e < buildinginfo[bid].w; e++) {
-			int pos = (x + d) + (y + e) * GetIsoSize();
-
-			Mini_UpdatePos(x + d, y + e, IsMultiplayer());
-		}
+bool CMapData::DeleteStructure(const size_t id)
+{
+	CString idStr;
+	idStr.Format("%d", id);
+	auto const idx = m_mapfile.GetSection("Structures").FindIndex(idStr);
+	if (idx >= 0) {
+		DeleteNthStructure(idx);
+		return true;
 	}
+	return false;
 }
 
 void CMapData::DeleteAircraft(DWORD dwIndex)
@@ -2062,7 +2180,7 @@ BOOL CMapData::AddWaypoint(CString id, DWORD dwPos)
 
 
 
-CString CMapData::GetStructureData(DWORD dwIndex, STRUCTURE* lpStructure) const
+CString CMapData::GetNthStructureData(DWORD dwIndex, STRUCTURE* lpStructure) const
 {
 	auto const [id, data] = GetNthDataOfTechno(dwIndex, TechnoType::Building);
 	if (!ParseStructureData(data, *lpStructure)) {
@@ -2071,13 +2189,29 @@ CString CMapData::GetStructureData(DWORD dwIndex, STRUCTURE* lpStructure) const
 	return id;
 }
 
-void CMapData::GetStdStructureData(DWORD dwIndex, STDOBJECTDATA* lpStdStructure) const
+void CMapData::GetStructureData(size_t id, STRUCTURE* lpStructure) const
+{
+	auto const& data = GetDataOfTechnoByID(id, TechnoType::Building);
+	if (!data.IsEmpty()) {
+		ParseStructureData(data, *lpStructure);
+	}
+}
+
+void CMapData::GetStdStructureData(const size_t id, STDOBJECTDATA* lpStdStructure) const
+{
+	auto const& data = GetDataOfTechnoByID(id, TechnoType::Building);
+	if (!data.IsEmpty()) {
+		ParseBasicTechnoData(data, *lpStdStructure);
+	}
+}
+
+void CMapData::GetNthStdStructureData(DWORD dwIndex, STDOBJECTDATA* lpStdStructure) const
 {
 	auto const [_, data] = GetNthDataOfTechno(dwIndex, TechnoType::Building);
 	ParseBasicTechnoData(data, *lpStdStructure);
 }
 
-BOOL CMapData::AddNode(NODE* lpNode, WORD dwPos)
+BOOL CMapData::AddNode(const NODE* lpNode, WORD dwPos, bool reloadAll)
 {
 	NODE node;
 	if (lpNode != NULL) {
@@ -2109,7 +2243,9 @@ BOOL CMapData::AddNode(NODE* lpNode, WORD dwPos)
 
 	m_mapfile.SetString(node.house, p, std::move(nodeRecord));
 
-	UpdateNodes(FALSE);
+	if (reloadAll) {
+		UpdateNodes(FALSE);
+	}
 
 	return TRUE;
 }
@@ -2274,15 +2410,14 @@ BOOL CMapData::AddStructure(STRUCTURE* lpStructure, LPCTSTR lpType, LPCTSTR lpHo
 	if (lpStructure != NULL) {
 		structure = *lpStructure;
 	} else {
-		char cx[10], cy[10];
-		itoa(dwPos % Map->GetIsoSize(), cx, 10);
-		itoa(dwPos / Map->GetIsoSize(), cy, 10);
+		auto const coord_x = dwPos % Map->GetIsoSize();
+		auto const coord_y = dwPos / Map->GetIsoSize();
 
 		structure.basic.strength = "256";
 		structure.basic.house = lpHouse;
 		structure.basic.type = lpType;
-		structure.basic.x = cx;
-		structure.basic.y = cy;
+		structure.basic.x.Format("%d", coord_x);
+		structure.basic.y.Format("%d", coord_y);
 		structure.tag = "None";
 		structure.direction = "0";
 		structure.flag1 = "1";
@@ -2316,7 +2451,29 @@ BOOL CMapData::AddStructure(STRUCTURE* lpStructure, LPCTSTR lpType, LPCTSTR lpHo
 	section.InsertOrAssign(id, value);
 
 	if (!m_noAutoObjectUpdate) {
-		UpdateStructures(FALSE);
+		auto const x = atoi(structure.basic.x);
+		auto const y = atoi(structure.basic.y);
+		const size_t idNum = atoi(id);
+		if (auto fieldData = GetFielddataAt(x, y)) {
+			STRUCTUREPAINT sp;
+			sp.col = ((CFinalSunDlg*)theApp.m_pMainWnd)->m_view.m_isoview->GetColor(structure.basic.house);
+			sp.strength = atoi(structure.basic.strength);
+			sp.upgrade1 = structure.upgrade1;
+			sp.upgrade2 = structure.upgrade2;
+			sp.upgrade3 = structure.upgrade3;
+			sp.upradecount = atoi(structure.upgradecount);
+			sp.x = x;
+			sp.y = y;
+			sp.direction = atoi(structure.direction);
+			sp.type = structure.basic.type;
+
+			TruncSpace(sp.upgrade1);
+			TruncSpace(sp.upgrade2);
+			TruncSpace(sp.upgrade3);
+
+			m_structurepaint.insert_or_assign(idNum, sp);
+		}
+		updateFieldDataAroundStructure(structure.basic.type, idNum, x, y);
 	}
 
 	return TRUE;
@@ -2470,7 +2627,7 @@ bool CMapData::ParseStructureData(const CString& rawText, STRUCTURE& structure) 
 	return true;
 }
 
-std::pair<CString, CString> CMapData::GetNthDataOfTechno(const size_t index, const TechnoType type) const
+static CString GetDataSection(const TechnoType type)
 {
 	CString sectionID;
 	switch (type)
@@ -2490,11 +2647,23 @@ std::pair<CString, CString> CMapData::GetNthDataOfTechno(const size_t index, con
 	default:
 		break;
 	}
-	auto const& section = m_mapfile.GetSection(sectionID);
+	return sectionID;
+}
+
+std::pair<CString, CString> CMapData::GetNthDataOfTechno(const size_t index, const TechnoType type) const
+{
+	auto const& section = m_mapfile.GetSection(GetDataSection(type));
 	if (index >= section.Size()) {
 		return {};
 	}
 	return section.Nth(index);
+}
+
+CString CMapData::GetDataOfTechnoByID(const size_t id, const TechnoType type) const
+{
+	CString idStr;
+	idStr.Format("%d", id);
+	return m_mapfile.GetString(GetDataSection(type), idStr);
 }
 
 bool CMapData::ParseBasicTechnoData(const CString& rawText, STDOBJECTDATA& data) const
@@ -2785,11 +2954,13 @@ BOOL CMapData::IsGroundObjectAt(DWORD dwPos) const
 	if (m_id < 0)
 		m_id = GetAirAt(dwPos);
 	if (m_id < 0)
-		m_id = GetStructureAt(dwPos);
+		m_id = GetTopStructureAt(dwPos);
 	if (m_id < 0)
 		m_id = GetTerrainAt(dwPos);
 
-	if (m_id < 0) return FALSE;
+	if (m_id < 0) {
+		return FALSE;
+	}
 
 	return TRUE;
 
@@ -2846,6 +3017,7 @@ void CMapData::GetStdAircraftData(DWORD dwIndex, STDOBJECTDATA* lpStdAircraft) c
 	auto const [_, data] = GetNthDataOfTechno(dwIndex, TechnoType::Aircraft);
 	ParseBasicTechnoData(data, *lpStdAircraft);
 }
+
 void CMapData::GetStdUnitData(DWORD dwIndex, STDOBJECTDATA* lpStdUnit) const
 {
 	auto const [_, data] = GetNthDataOfTechno(dwIndex, TechnoType::Unit);
@@ -2855,6 +3027,29 @@ void CMapData::GetStdUnitData(DWORD dwIndex, STDOBJECTDATA* lpStdUnit) const
 DWORD CMapData::GetInfantryCount() const
 {
 	return m_infantry.size();//m_mapfile.sections["Infantry"].values.size();
+}
+
+std::vector<NODE> CMapData::CollectAllBaseNodes() const
+{
+	size_t total = 0;
+	for (auto const& [seq, id] : m_mapfile[MAPHOUSES]) {
+		total += m_mapfile.GetInteger(id, "NodeCount");
+	}
+	std::vector<NODE> ret;
+	ret.reserve(total);
+
+	for (auto const& [seq, id] : m_mapfile[MAPHOUSES]) {
+		auto const& sec = m_mapfile.GetSection(id);
+		const int nodeCount = sec.GetInteger("NodeCount");
+		for (auto idx = 0; idx < nodeCount; idx++) {
+			auto const& nodeVal = sec.GetString(GetNodeID(idx));
+			auto const type = GetParam(nodeVal, 0);
+			const CString y = GetParam(nodeVal, 1);
+			const CString x = GetParam(nodeVal, 2);
+			ret.push_back(NODE{ id, type, x, y });
+		}
+	}
+	return ret;
 }
 
 DWORD CMapData::GetUnitCount() const
@@ -3119,8 +3314,9 @@ void CMapData::UpdateMapFieldData(BOOL bSave)
 			if (pos < (GetIsoSize() + 1) * (GetIsoSize() + 1)) {
 				fielddata[pos].wGround = mfd->wGround;
 				fielddata[pos].bHeight = mfd->bHeight;
-				memcpy(&fielddata[pos].bMapData, mfd->bData, 3);
-				memcpy(&fielddata[pos].bMapData2, mfd->bData2, 1);
+				fielddata[pos].bMapData = mfd->wTileNum;
+				fielddata[pos].bSubTile = mfd->bSubTile;
+				fielddata[pos].bMapData2 = mfd->bIceGrowth;
 
 				int replacement = 0;
 				int ground = mfd->wGround;
@@ -3241,8 +3437,8 @@ void CMapData::UpdateMapFieldData(BOOL bSave)
 				mfd->wX = dwY;
 				mfd->wY = dwX;
 				mfd->bHeight = fielddata[i].bHeight;
-				memcpy(&mfd->bData, &fielddata[i].bMapData, 3); // includes fielddata[i].bSubTile!
-				memcpy(&mfd->bData2, &fielddata[i].bMapData2, 1);
+				mfd->wTileNum = fielddata[i].bMapData;
+				mfd->bSubTile = fielddata[i].bSubTile;
 
 				p++;
 			}
@@ -5478,11 +5674,12 @@ void CMapData::Paste(int x, int y, int z_mod)
 	CloseClipboard();
 }
 
-void CMapData::GetStructurePaint(int index, STRUCTUREPAINT* lpStructurePaint) const
+void CMapData::GetStructurePaint(int index, STRUCTUREPAINT& structurePaint) const
 {
-	if (index < 0 || index >= m_structurepaint.size()) return;
-
-	*lpStructurePaint = m_structurepaint[index];
+	auto const it = m_structurepaint.find(index);
+	if (it != m_structurepaint.end()) {
+		structurePaint = it->second;
+	}
 }
 
 void CMapData::InitMinimap()
@@ -5668,6 +5865,8 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 	CString* ct_tag = new(CString[GetCelltagCount()]);
 	int ct_count = GetCelltagCount();
 	DWORD* ct_pos = new(DWORD[GetCelltagCount()]);
+	auto baseNodes = CollectAllBaseNodes();
+	auto const smudgeSize = m_mapfile["Smudge"].Size();
 
 	// Now copy the objects into above arrays and delete them from map
 	for (int i = 0; i < inf_count; i++) {
@@ -5693,8 +5892,9 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 
 		str[i] = obj;
 	}
-	for (int i = str_count - 1; i >= 0; i--)
-		DeleteStructure(i);
+	for (int i = str_count - 1; i >= 0; i--) {
+		DeleteNthStructure(i);
+	}
 
 	for (int i = 0; i < unit_count; i++) {
 		UNIT obj;
@@ -5740,14 +5940,13 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 	}
 
 	auto const old_fd = std::exchange(fielddata, {});
-	int ow = GetWidth();
-	int oh = GetHeight();
-	int os = GetIsoSize();
+	const int oldWidth = GetWidth();
+	const int oldHeight = GetHeight();
+	const int oldIsoSize = GetIsoSize();
 	auto const old_fds = fielddata.size();
 
-	int left = iLeft;
-	int top = iTop;
-
+	const int leftExpansion = iLeft;
+	const int topExpansion = iTop;
 
 	// hmm, erase any snapshots... we probably can remove this and do coordinate conversion instead
 	// but for now we just delete them...
@@ -5770,27 +5969,29 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 	dwSnapShotCount = 0;
 	m_cursnapshot = -1;
 
-
-	char c[50];
 	CString mapsize;
-	itoa(dwNewWidth, c, 10);
-	mapsize = "0,0,";
-	mapsize += c;
-	itoa(dwNewHeight, c, 10);
-	mapsize += ",";
-	mapsize += c;
+	mapsize.Format("0,0,%d,%d", dwNewWidth, dwNewHeight);
 
 	m_mapfile.SetString("Map", "Size", mapsize);
 
-	itoa(dwNewWidth - 4, c, 10);
-	mapsize = "2,4,";
-	mapsize += c;
-	itoa(dwNewHeight - 6, c, 10);
-	mapsize += ",";
-	mapsize += c;
+	{
+		auto const oldVisualRect = m_mapfile.GetString("Map", "LocalSize");
+		auto const newVisualLeft = std::max(1, atoi(GetParam(oldVisualRect, 0)) + leftExpansion);
+		auto const newVisualTop = std::max(1, atoi(GetParam(oldVisualRect, 1)) + topExpansion);
+		auto newVisualWidth = std::min<int>(dwNewWidth, atoi(GetParam(oldVisualRect, 2)));
+		auto newVisualHeight = std::min<int>(dwNewHeight, atoi(GetParam(oldVisualRect, 3)));
 
-	m_mapfile.SetString("Map", "LocalSize", mapsize);
+		if (newVisualWidth + newVisualLeft > dwNewWidth) {
+			newVisualWidth = dwNewWidth - newVisualLeft - 1;
+		}
+		if (newVisualHeight + newVisualTop > dwNewHeight) {
+			newVisualHeight = dwNewHeight - newVisualTop - 1;
+		}
 
+		mapsize.Format("%d,%d,%d,%d", newVisualLeft, newVisualTop, newVisualWidth, newVisualHeight);
+
+		m_mapfile.SetString("Map", "LocalSize", mapsize);
+	}
 
 	CalcMapRect();
 	ClearOverlay();
@@ -5805,15 +6006,16 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 
 	errstream << "ResizeMap() frees m_mfd\n";
 	errstream.flush();
-	if (m_mfd != NULL) delete[] m_mfd;
+	if (m_mfd != NULL) {
+		delete[] m_mfd;
+	}
 	m_mfd = NULL;
-
 
 	// x_move and y_move specify the movement for each field, related to the old position
 	int x_move = 0;
 	int y_move = 0;
 
-	x_move += (dwNewWidth - ow);
+	x_move += (dwNewWidth - oldWidth);
 
 
 	// x_move and y_move now take care of the map sizing. This means,
@@ -5821,11 +6023,11 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 	// but we want to consider left and right, as the user selected it.
 	// so, do some coordinate conversion:
 
-	x_move += top;
-	y_move += top;
+	x_move += topExpansion;
+	y_move += topExpansion;
 
-	x_move += -left;
-	y_move += left;
+	x_move += -leftExpansion;
+	y_move += leftExpansion;
 
 	//char c[50];
 	/*char d[50];
@@ -5837,18 +6039,17 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 	};
 
 	// copy tiles now
-	for (int i = 0; i < os; i++) {
-		for (int e = 0; e < os; e++) {
-			int x, y;
-			x = i + x_move;
-			y = e + y_move;
+	for (int i = 0; i < oldIsoSize; i++) {
+		for (int e = 0; e < oldIsoSize; e++) {
+			const int x = i + x_move;
+			const int y = e + y_move;
 
 			if (!isInMap(x, y)) {
 				continue;
 			}
 
 			FIELDDATA& fdd = fielddata[x + y * m_IsoSize];
-			const FIELDDATA& fdo = old_fd.at(i + e * os);
+			const FIELDDATA& fdo = old_fd.at(i + e * oldIsoSize);
 
 			fdd.bCliffHack = fdo.bCliffHack;
 			fdd.bHeight = fdo.bHeight;
@@ -5861,12 +6062,24 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 			fdd.overlay = fdo.overlay;
 			fdd.overlaydata = fdo.overlaydata;
 			fdd.wGround = fdo.wGround;
+			fdd.node = fdo.node;
+			fdd.smudge = fdo.smudge;
+			fdd.smudgetype = fdo.smudgetype;
 		}
 	}
 
 	// MW 07/22/01: Added Progress dialog - it just was slow, and did not crash...
-	int allcount = GetInfantryCount() + GetAircraftCount() + GetUnitCount() + GetStructureCount() + GetTerrainCount() + GetWaypointCount() + GetCelltagCount();
-	int curcount = 0;
+	const int allcount = GetInfantryCount() 
+		+ GetAircraftCount() 
+		+ GetUnitCount() 
+		+ GetStructureCount()
+		+ GetTerrainCount() 
+		+ GetWaypointCount() 
+		+ GetCelltagCount()
+		+ baseNodes.size()
+		+ smudgeSize
+		;
+	int progress = 0;
 	CProgressDlg* dlg = new(CProgressDlg)("Updating objects, please wait");
 	dlg->SetRange(0, allcount - 1);
 	dlg->ShowWindow(SW_SHOW);
@@ -5888,7 +6101,7 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 	int count = inf_count; // this temp variable is *needed* (infinite loop)!!!
 	for (int i = 0; i < count; i++) {
 		if (inf[i].deleted) {
-			dlg->SetPosition(i + curcount);
+			dlg->SetPosition(i + progress);
 			dlg->UpdateWindow();
 
 			continue; // MW June 12 01
@@ -5903,12 +6116,12 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 
 		AddInfantry(&obj);
 
-		dlg->SetPosition(i + curcount);
+		dlg->SetPosition(i + progress);
 		dlg->UpdateWindow();
 
 	}
 
-	curcount += count;
+	progress += count;
 
 	count = air_count;
 	for (int i = 0; i < count; i++) {
@@ -5923,13 +6136,13 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 
 		AddAircraft(&obj);
 
-		dlg->SetPosition(i + curcount);
+		dlg->SetPosition(i + progress);
 		dlg->UpdateWindow();
 	}
 
 	UpdateAircraft(FALSE);
 
-	curcount += count;
+	progress += count;
 
 	count = str_count;
 	for (int i = 0; i < count; i++) {
@@ -5944,13 +6157,13 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 
 		AddStructure(&obj);
 
-		dlg->SetPosition(i + curcount);
+		dlg->SetPosition(i + progress);
 		dlg->UpdateWindow();
 	}
 
 	UpdateStructures(FALSE);
 
-	curcount += count;
+	progress += count;
 
 	count = unit_count;
 	for (int i = 0; i < count; i++) {
@@ -5965,18 +6178,18 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 
 		AddUnit(&obj);
 
-		dlg->SetPosition(i + curcount);
+		dlg->SetPosition(i + progress);
 		dlg->UpdateWindow();
 	}
 
 	UpdateUnits(FALSE);
 
-	curcount += count;
+	progress += count;
 
 	count = terrain_count;
 	for (int i = 0; i < count; i++) {
 		if (terrain[i].deleted) {
-			dlg->SetPosition(i + curcount);
+			dlg->SetPosition(i + progress);
 			dlg->UpdateWindow();
 			continue; // MW June 12 01
 		}
@@ -5998,14 +6211,14 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 
 		AddTerrain(obj, x + y * m_IsoSize);
 
-		dlg->SetPosition(i + curcount);
+		dlg->SetPosition(i + progress);
 		dlg->UpdateWindow();
 	}
 
 	//UpdateTerrain(TRUE);
 	//UpdateTerrain(FALSE);
 
-	curcount += count;
+	progress += count;
 
 	count = wp_count;
 	for (int i = 0; i < count; i++) {
@@ -6015,8 +6228,8 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 		pos = wp_pos[i];
 		id = wp_id[i];
 
-		int x = pos % os + x_move;
-		int y = pos / os + y_move;
+		int x = pos % oldIsoSize + x_move;
+		int y = pos / oldIsoSize + y_move;
 
 		if (!isInMap(x, y)) {
 			continue;
@@ -6024,21 +6237,21 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 
 		AddWaypoint(id, x + y * m_IsoSize);
 
-		dlg->SetPosition(i + curcount);
+		dlg->SetPosition(i + progress);
 		dlg->UpdateWindow();
 	}
 
 	UpdateWaypoints(FALSE);
 
-	curcount += count;
+	progress += count;
 
 
 	for (int i = 0; i < ct_count; i++) {
 		DWORD pos = ct_pos[i];
 		CString tag = ct_tag[i];
 
-		int x = pos % os + x_move;
-		int y = pos / os + y_move;
+		int x = pos % oldIsoSize + x_move;
+		int y = pos / oldIsoSize + y_move;
 
 		if (!isInMap(x, y)) {
 			continue;
@@ -6046,12 +6259,65 @@ void CMapData::ResizeMap(int iLeft, int iTop, DWORD dwNewWidth, DWORD dwNewHeigh
 
 		AddCelltag(tag, x + y * m_IsoSize);
 
-		dlg->SetPosition(i + curcount);
+		dlg->SetPosition(i + progress);
 		dlg->UpdateWindow();
 	}
+	progress += ct_count;
 
 	UpdateCelltags(FALSE);
 
+	// base nodes
+	if (!baseNodes.empty()) {
+		int progressCounter = 0;
+		CString lastHouse;
+		for (auto& node : baseNodes) {
+			const int x = atoi(node.x) + x_move;
+			const int y = atoi(node.y) + y_move;
+
+			if (!isInMap(x, y)) {
+				continue;
+			}
+			node.x.Format("%d", x);
+			node.y.Format("%d", y);
+
+			if (node.house != lastHouse) {
+				lastHouse = node.house;
+				// first time handling this house, reset
+				if (auto pNodeSec = m_mapfile.TryGetSection(node.house)) {
+					for (auto idx = m_mapfile.GetInteger(node.house, "NodeCount") - 1; idx >= 0; --idx) {
+						DeleteBuildingNodeFrom(node.house, idx, m_mapfile);
+					}
+				}
+			}
+			AddNode(&node, 0, false);
+
+			dlg->SetPosition(progressCounter++ + progress);
+			dlg->UpdateWindow();
+		}
+		progress += progressCounter;
+	}
+
+	if (!m_smudges.empty()) {
+		int progressCounter = 0;
+		for (auto& smudge : m_smudges) {
+			const int x = smudge.x + x_move;
+			const int y = smudge.y + y_move;
+
+			if (!isInMap(x, y)) {
+				smudge.deleted = true;
+				continue;
+			}
+			smudge.x = x;
+			smudge.y = y;
+
+			dlg->SetPosition(progressCounter++ + progress);
+			dlg->UpdateWindow();
+		}
+		UpdateSmudges(TRUE);
+		progress += progressCounter;
+	}
+
+	// data transfer complete!
 	m_noAutoObjectUpdate = FALSE;
 
 	errstream << "Delete old_fd" << endl;
@@ -6166,14 +6432,14 @@ BOOL CMapData::IsYRMap()
 
 		count = GetStructureCount();
 		for (i = 0; i < count; i++) {
-			STRUCTURE str;
-			GetStructureData(i, &str);
+			STRUCTURE structure;
+			GetNthStructureData(i, &structure);
 
-			if (str.deleted) {
+			if (structure.deleted) {
 				continue;
 			}
 
-			if (g_data["YRBuildings"].Exists(str.basic.type)) {
+			if (g_data["YRBuildings"].Exists(structure.basic.type)) {
 				return TRUE;
 			}
 		}
@@ -6263,7 +6529,9 @@ BOOL CMapData::AddSmudge(SMUDGE* lpSmudge)
 	td = *lpSmudge;
 	int pos = td.x + td.y * GetIsoSize();
 
-	if (smudgeid.find(td.type) == smudgeid.end()) return FALSE;
+	if (smudgeid.find(td.type) == smudgeid.end()) {
+		return FALSE;
+	}
 
 	BOOL bFound = FALSE;
 
@@ -6314,7 +6582,6 @@ void CMapData::DeleteSmudge(DWORD dwIndex)
 
 void CMapData::UpdateSmudges(BOOL bSave, int num)
 {
-	vector<SMUDGE>& smudges = m_smudges;
 
 	if (bSave == FALSE) {
 		auto const& sec = m_mapfile.GetSection("Smudge");
@@ -6323,8 +6590,8 @@ void CMapData::UpdateSmudges(BOOL bSave, int num)
 		}
 
 		if (num < 0) {
-			smudges.clear();
-			smudges.reserve(100);
+			m_smudges.clear();
+			m_smudges.reserve(100);
 
 			for (auto i = 0; i < GetIsoSize() * GetIsoSize(); i++) {
 				fielddata[i].smudge = -1;
@@ -6350,7 +6617,7 @@ void CMapData::UpdateSmudges(BOOL bSave, int num)
 				td.x = x;
 				td.y = y;
 
-				smudges.push_back(td);
+				m_smudges.push_back(td);
 
 				int pos = x + y * GetIsoSize();
 				fielddata[pos].smudge = i;
@@ -6364,15 +6631,15 @@ void CMapData::UpdateSmudges(BOOL bSave, int num)
 	}
 
 
-
+	// SAVE == TRUE
 	//if(num<0)
 	{
 		//if(m_mapfile.sections.find("Smudge")!=m_mapfile.sections.end()) MessageBox(0,"Reupdate!","",0);
 		m_mapfile.DeleteSection("Smudge");
 		int i;
 
-		for (i = 0; i < smudges.size(); i++) {
-			auto const& td = smudges[i];
+		for (i = 0; i < m_smudges.size(); i++) {
+			auto const& td = m_smudges[i];
 			if (!td.deleted) {
 				char numBuffer[50];
 				CString val = td.type;

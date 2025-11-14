@@ -45,6 +45,7 @@
 #include "TileSetBrowserFrame.h"	// Hinzugefügt von der Klassenansicht
 #include "ToolSettingsBar.h"
 #include "TriggerEditorDlg.h"
+#include "CsfViewer.h"
 
 #if _MSC_VER > 1000
 #pragma once
@@ -59,7 +60,8 @@ class CFinalSunDlg : public CDialog
 {
 	// Konstruktion
 public:
-	void OpenMap(LPCSTR lpFilename);
+	void UnloadAll(bool ask = true);
+	void OpenMap(const CString lpFilename);
 	void InsertPrevFile(CString lpFilename);
 	void CheckAvail(CCmdUI* pCmdUI);
 	virtual BOOL PreTranslateMessage(MSG* pMsg);
@@ -83,6 +85,7 @@ public:
 	CTags m_tags;
 	CTaskForce m_taskforces;
 	CTeamTypes m_teamtypes;
+	CCsfViewer m_csfStrings;
 
 	CHouses m_houses;
 
@@ -230,7 +233,6 @@ protected:
 	//}}AFX_MSG
 	DECLARE_MESSAGE_MAP()
 private:
-	void UnloadAll();
 
 	HCURSOR m_hGameCursor;
 
